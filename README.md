@@ -2,7 +2,7 @@
 
 ## Description
 
-A shell script that works as a drop-in replacement for `ntml_auth` when used for MSCHAP v2 authentication, so no full Samba installation is required in many situations; at least if the correct plugin exists. The task of plugin is to fetch the plain-text user password or the pre-calculated MD4 user password hash (also known as NTHASH or sambaNTHash or just NTML password).
+A shell script that works as a drop-in replacement for `ntml_auth` when used for MSCHAP v2 authentication, so no full Samba installation is required in many situations; at least if the correct plugin exists. The task of plugin is to fetch the plain-text user password or the pre-calculated MD4 user password hash (also known as `NTHASH` or `sambaNTHash` or just `NTML password`).
 
 
 ## Usage
