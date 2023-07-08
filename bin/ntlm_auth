@@ -1,0 +1,286 @@
+#!/bin/sh
+
+set -eu
+
+error( )
+{
+	( printf "ERROR: %s" "$1" \
+		| tr '\n' ' '         \
+		| sed 's/^ *//'       \
+		| sed 's/ *$//' ) >&2
+	printf '\n' >&2
+	exit 1
+}
+
+
+# Parse arguments
+
+plugin=
+username=
+challenge=
+ntResponse=
+pluginArgs=
+requestNtKeySeen=
+
+while [ $# -gt 0 ]
+do
+	case $1 in
+		'--request-nt-key') requestNtKeySeen=1 ;;
+
+		'--username='*)
+			username=${1#*=}
+			;;
+
+		'--challenge='*)
+			challenge=${1#*=}
+			;;
+
+		'--nt-response='*)
+			ntResponse=${1#*=}
+			;;
+
+		'--allow-mschapv2') ;; # Just Ignore
+
+		'--plugin='*)
+			plugin=${1#*=}
+			;;
+
+		'--plugin-args='*)
+			pluginArgs=${1#*=}
+			;;
+
+		*)
+			echo "Unkonwn option \"$1\" ignored." >&2
+	esac
+	shift
+done
+
+# Allow environment variables to fill the blanks
+
+plugin=${plugin:=$NTLM_AUTH_PLUGIN}
+pluginArgs=${pluginArgs:=${NTLM_AUTH_PLUGIN_ARGS:=}}
+
+
+# Verify parameters are sane
+
+[ -n "$username" ] || error "--username argument missing!"
+[ -n "$challenge" ] || error "--challenge argument missing!"
+[ -n "$ntResponse" ] || error "--nt-response argument missing!"
+[ -n "$requestNtKeySeen" ] || error "--request-nt-key argument missing!"
+
+[ -n "$plugin" ] || error "
+Plugin not set! Either NTLM_AUTH_PLUGIN environment variable must be set or
+--plugin= parameter must be provided"
+
+
+len=${#challenge}
+[ "$len" -lt 16 ] && error "Challenge is too short! ($len)"
+[ "$len" -gt 16 ] && error "Challenge is too long! ($len)"
+
+len=${#ntResponse}
+[ "$len" -lt 48 ] && error "NT Response is too short! ($len)"
+[ "$len" -gt 48 ] && error "NT Response is too long! ($len)"
+
+
+[ -x "$plugin" ] || error " $plugin does not exist or is not executable!"
+
+
+# Fetch and veriy password hash
+
+fetchPasswordHash( )
+{
+	export NTLM_AUTH_PLUGIN_USER="$username"
+	# shellcheck disable=2086
+	set -- $pluginArgs
+	"$plugin" "$@"
+}
+
+
+passwordHash=$( fetchPasswordHash )
+len=${#passwordHash}
+[ "$len" -lt 32 ] && error "Password hash is too short! ($len)"
+[ "$len" -gt 32 ] && error "Password hash is too long! ($len)"
+
+case $passwordHash in
+	[a-fA-F0-9]*) ;;
+	*) error "Password hash must only contain hex digits!"
+esac
+
+
+# Convert hex values to upper case
+
+pipe2uppercase( )
+{
+	tr '[:lower:]' '[:upper:]'
+}
+
+
+uppercase( )
+{
+	printf "%s" "$1" | pipe2uppercase
+}
+
+challenge="$( uppercase "$challenge" )"
+ntResponse="$( uppercase "$ntResponse" )"
+passwordHash="$( uppercase "$passwordHash" )"
+
+
+# Expand password hash to 21 bytes (42 hex bytes) by appending zeros
+
+expPwHash="${passwordHash}00000000000000000000"
+
+
+# Split into 3 groups of 7 bytes
+
+# $1 string
+# $2 index of first char
+# $3 index of last char
+substr( )
+(
+	prefix=".\\{$2\\}"
+	pattern="\\(.\\{$(( $3 - $2 + 1 ))\\}\\)"
+	expr "$1" : "$prefix$pattern"
+)
+
+pwHash1=$( substr "$expPwHash" 0 13 )
+pwHash2=$( substr "$expPwHash" 14 27 )
+pwHash3=$( substr "$expPwHash" 28 41 )
+
+
+# Expand each group to 8 bytes
+
+hex2bin( )
+(
+	outdigits=$(( ${#1} * 4  ))
+	digits=$( printf "obase=2; ibase=16; %s\n" "$(uppercase "$1")" | bc )
+	missing=$(( outdigits - ${#digits} ))
+	while [ $missing -gt 0 ]
+	do
+		missing=$(( missing - 1 ))
+		printf "0"
+	done
+	printf "%s" "$digits"
+)
+
+
+bin2hex( )
+(
+	outdigits=$(( ${#1} / 4  ))
+	digits=$( printf "obase=16; ibase=2; %s\n" "$1" | bc )
+	missing=$(( outdigits - ${#digits} ))
+	while [ $missing -gt 0 ]
+	do
+		missing=$(( missing - 1 ))
+		printf "0"
+	done
+	printf "%s" "$digits"
+)
+
+
+countOnes( )
+{
+	printf "%s" "$1" | tr 1 '\n' | wc -l
+}
+
+
+expand7to8BitsWithOddParity( )
+(
+	bits=$1
+	index=0
+	byteCount=$(( ${#bits} / 7 ))
+
+	while [ $byteCount -gt 0 ]
+	do
+		byteCount=$(( byteCount - 1 ))
+		nextByte=$( substr "$bits" $index $(( index + 6 )) )
+		index=$(( index + 7 ))
+
+		if [ $(( $( countOnes "$nextByte" ) & 1 )) -eq 1  ]
+		then
+			nextByte="${nextByte}0"
+		else
+			nextByte="${nextByte}1"
+		fi
+		printf "%s" "$nextByte"
+	done
+)
+
+
+expandKey( )
+(
+	binKey=$( hex2bin "$1" )
+	expandedBinKey=$( expand7to8BitsWithOddParity "$binKey" )
+	printf "%s" "$( bin2hex "$expandedBinKey" )"
+)
+
+
+key1=$( expandKey "$pwHash1" )
+key2=$( expandKey "$pwHash2" )
+key3=$( expandKey "$pwHash3" )
+
+
+# Encrypt the "challenge" once with every group using DES encryption
+
+printHexBytes( )
+(
+	# shellcheck disable=2016
+	awkScript='
+		{
+			for (i = 1; i <= length($0); i += 2) {
+				hex = substr($0, i, 2)
+       			dec = 0
+        		for (j = 1; j <= 2; j++) {
+            		c = index("0123456789ABCDEF", substr(hex, j, 1))
+            		dec = dec * 16 + c - 1
+        		}
+        		printf "%c", dec
+			}
+		}
+	'
+	printf "%s\n" "$1" | awk "$awkScript"
+)
+
+
+readHexBytes( )
+{
+	od -An -tx1 | tr -d ' \n' | pipe2uppercase
+}
+
+
+pipeEncryptDES( )
+{
+	openssl enc -nopad -des-ecb -K "$1"
+}
+
+
+# $1 key
+encryptChallenge( )
+{
+	printHexBytes "$challenge" | pipeEncryptDES "$1" | readHexBytes
+}
+
+
+calcNTResponse="$( encryptChallenge "$key1" )"
+calcNTResponse="$calcNTResponse$( encryptChallenge "$key2" )"
+calcNTResponse="$calcNTResponse$( encryptChallenge "$key3" )"
+
+if [ "$ntResponse" != "$calcNTResponse" ]
+then
+	reason="NT-Response mismatch ($ntResponse != $calcNTResponse)"
+	error "Authentication failed! Reason: $reason"
+fi
+
+
+pipeHashMD4( )
+{
+	openssl dgst -md4 -binary
+}
+
+
+hash( )
+{
+	printHexBytes "$1" | pipeHashMD4 | readHexBytes
+}
+
+
+printf 'NT_KEY: %s\n' "$( hash "$passwordHash" )"
