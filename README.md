@@ -30,3 +30,8 @@ Note that the last two arguments can also be set via the environment variables `
 The only requirement aside from a [POSIX shell environment](https://pubs.opengroup.org/onlinepubs/9699919799/utilities/toc.html) is [OpenSSL](https://www.openssl.org/) to perform the cryptographic operations.
 
 Note that plugins may have requirements of their own but those are only relevant if that plugin is in use.
+
+
+## Plugins
+
+See [plugin README](plugins/README.md).
